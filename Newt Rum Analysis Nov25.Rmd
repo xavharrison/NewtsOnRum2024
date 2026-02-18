@@ -1,0 +1,955 @@
+---
+title: "Palmate Newts Rum Analysis 2025"
+author: "Xav Harrison & Emma Remotti"
+date: "2023-03-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Data and Libraries 
+
+## Libraries
+
+```{r}
+  library(phyloseq) #if not installed: install.packages('devtools')
+  library(devtools) #if not installed: install_github("microbiome/microbiome") # Install the package
+  library(microbiome)
+  library(dplyr)
+  library(ggplot2)
+  library(cowplot)
+  library(RColorBrewer)
+  library(remotes) #if not installed: remotes::install_github("jfq3/ggordiplots")
+  library(ggordiplots)
+  library(vegan)
+  library(ALDEx2) #to install: BiocManager::install("ALDEx2")
+  library(decontam)
+  library(brms)
+  library(MoMAColors)
+  library(ggrepel)
+  library(ggvenn)
+  library(gllvm)
+  library(microbiomeutilities) #devtools::install_github("microsud/microbiomeutilities")
+  library(ggvegan)
+
+
+```
+
+## Global Plotting Options 
+Quick access options for output graphics to make legends and axis labels larger / more legible
+
+```{r}
+
+### Site Colours for Visit One From Paired Palette
+  sitecols<-brewer.pal(8,"Paired")[c(1,3,5,7)]
+```
+
+## Data
+
+```{r}
+
+         ####### READ IN FILES
+          
+            #Taxonomy
+              tax1<-readRDS('Newt 2021 Taxonomy.rds')
+              #rownames(tax1)<-paste0("SV",seq(nrow(tax1)))
+          
+            #Sample Metadata  
+              sample1<-readRDS('Newt 2021 SampleData.rds')
+              head(sample1)
+              colnames(sample1)[1]<-"swab"
+              sample1$visit<-ifelse(grepl("C$",sample1$swab),2,1)
+              sample1$swab_time<-with(sample1,paste(gsub("C$","",swab),visit,sep="_"))
+              write.csv(sample1,'Newt Sample Data.csv')
+              
+            ## Additional Metadata
+              meta1<-read.csv('Newt Metadata Full Feb17 R Input.csv')
+              head(meta1)
+              meta1$swab_time<-with(meta1,paste(swab,visit,sep="_"))
+              
+              
+            #Copy Across Metadata  
+              sample2<-sample1 %>% dplyr::select(swab_time) %>% left_join(meta1,"swab_time")
+              #head(sample2)
+              sample2$site<- sapply(strsplit(sample2$swab,"-"),"[",1)
+              rownames(sample2)<-sample1[,1]
+              
+            ##Sample Type
+              sample2$sampletype<-"swab"
+              sample2$sampletype[grep("MC",rownames(sample2))]<-"mock"
+              sample2$sampletype[grep("NEG",rownames(sample2))]<-"negative_control"
+              
+            #Sequence Abundance
+              otu1<-readRDS('Newt 2021 SeqTab.rds')
+              #head(otu1)
+              
+              #Infection Data
+                infection<-read.csv('newt infection codes.csv',header=T)
+                head(infection)
+                infection$swab_time<-with(infection,paste(swab,timecode,sep="_"))
+                sample2$infectioncode<-infection$lesion[match(sample2$swab_time,infection$swab_time)]
+                  head(sample2)
+          
+            #Re-Name Rows with COrrect Sample IDs
+              rownames(otu1)<-sample1[,1]
+       
+
+```
+
+## Phyloseq Build
+
+```{r}
+
+newt <- phyloseq(otu_table(otu1,taxa_are_rows = FALSE),   # create new phyloseq otu table, call it "newt"
+                 sample_data(sample2), 
+                 tax_table((tax1)))
+newt 
+
+```
+
+
+
+## Decontamination
+
+```{r}
+
+         ##### REMOVE  MOCK SAMPLES
+              
+              newt.nomock<-prune_samples(sample_data(newt)$sampletype %in% c("swab","negative_control"),newt)
+              newt.nomock
+              
+              #colnames(tax_table(newt.nomock))<-c("Kingdom","Phylum","Class","Order","Family","Genus","Species")
+              
+              
+        ###### REMOVE NEGATIVE CONTAMINATION
+              
+              sample_data(newt.nomock)$is.neg <- ifelse(grepl("negative_control",sample_data(newt.nomock)$sampletype),TRUE,FALSE)
+              contamdf.prev <- isContaminant(newt.nomock, method="prevalence", neg="is.neg",threshold=0.5)
+              table(contamdf.prev$contaminant)
+              
+                # 33 contaminants identified 
+              
+              ###### Plot of Contaminant Frequency 
+                    # Make phyloseq object of presence-absence in negative controls and true samples
+                        ps.pa <- transform_sample_counts(newt.nomock, function(abund) 1*(abund>0))
+                        ps.pa.neg <- prune_samples(sample_data(ps.pa)$is.neg == TRUE, ps.pa)
+                        ps.pa.pos <- prune_samples(sample_data(ps.pa)$is.neg == FALSE, ps.pa)
+                        
+                    # Make data.frame of prevalence in positive and negative samples
+                        df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                                        contaminant=contamdf.prev$contaminant)
+                        
+                          ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+                            xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+                    
+              ###### Clean Contaminants Out
+                          newt.clean<-prune_taxa(contamdf.prev$contaminant==FALSE,newt.nomock)
+                          ntaxa(newt.nomock) - ntaxa(newt.clean)
+                          
+
+```
+
+## Further Cleaning
+
+```{r}
+
+        ##### REMOVE NEGATIVES SAMPLES
+              
+              newt.clean<-prune_samples(sample_data(newt.clean)$sampletype=="swab",newt.clean)
+              newt.clean
+              
+        #Prune Taxa With No Phylum Assignment 
+          ps_prune<-prune_taxa(as.vector(!is.na(tax_table(newt.clean)[,2])),newt.clean)
+          ntaxa(newt.clean)-ntaxa(ps_prune) #232 lost
+        
+        #Prune Chloroplasts
+          ps_prune_nochloro<-prune_taxa(as.vector(tax_table(ps_prune)[,3]!="Chloroplast"),ps_prune)
+          ntaxa(ps_prune)-ntaxa(ps_prune_nochloro) #431 lost
+        
+        #Remove Mitochondria    
+          ps_prune_nochloro_nomito<-prune_taxa(as.vector(tax_table(ps_prune_nochloro)[,5]!="Mitochondria"),ps_prune_nochloro)
+        
+        #Remove Archaea 
+          ps_prune_nochloro_noarchaea<-prune_taxa(as.vector(tax_table(ps_prune_nochloro_nomito)[,1]!="Archaea"),ps_prune_nochloro_nomito)
+            ntaxa(ps_prune_nochloro_noarchaea)-ntaxa(ps_prune_nochloro_nomito) #93 lost
+```
+
+## Filter Based on Prevalence and Abundance
+
+```{r}
+              
+####### Read Threshold and Sample Prevalence Threshold
+    ps_clean_filter = filter_taxa(ps_prune_nochloro_noarchaea, function(x) sum(x > 20) > (0.02*length(x)), TRUE)
+
+```
+
+## Mock Community 
+```{r}
+
+##Inspect Mock After Removing ASVs filtered at previous step 
+  ps_mock<-prune_samples(sample_data(newt)$sampletype %in% c("mock"),newt)
+  ps_mock<-filter_taxa(ps_mock, function(x) (sum(x) > 0),TRUE)
+  data.frame(reads=taxa_sums(ps_mock),genus=unname(tax_table(ps_mock))[,6])
+
+```
+
+##Library Sizes After Cleaning 
+
+```{r}
+
+#Summary
+ range(sample_sums(ps_clean_filter)) 
+  mean(sample_sums(ps_clean_filter)) 
+#Table
+  sample_sums(ps_clean_filter)
+
+```
+
+ 
+# Prevalence Models 
+
+## Probability of Observing C and D Infection 
+
+```{r}
+
+sample2$C_or_D<-ifelse(sample2$infectioncode %in% c("C","D"),1,0)
+#table(sample2$infectioncode)
+with(sample2,table(infectioncode,site))
+
+prev_mod1<-brm(C_or_D ~ site,data = sample2,family=bernoulli()) 
+  summary(prev_mod1)
+
+```
+
+# ALPHA DIVERSITY
+
+## Alpha Calculations First Visit
+```{r}
+
+##Rarefy 
+  newt1<-prune_samples(sample_data(ps_clean_filter)$visit==1 & sample_data(ps_clean_filter)$site!="R44",ps_clean_filter)
+  newt1 #121 samples after removing R44
+
+#Rarefy data 5000 reads 
+  newt1r<-rarefy_even_depth(newt1,rngseed = 01042020,sample.size = 5000) 
+  #range(sample_sums(newt1r))
+
+##Estimate alpha diversity metrics
+    newt1_rich<-estimate_richness(newt1r,measures=c("Observed"))
+    newt1_rich$swab<-gsub("\\.","-",rownames(newt1_rich)) 
+    newt1_rich$swab_time<-with(newt1_rich,paste(swab, "1",sep="_"))
+##Join  
+  newt1_rich_meta<-left_join(newt1_rich,sample2,"swab_time")
+  head(newt1_rich_meta)
+  
+
+##Standardise and Factorise 
+  newt1_rich_meta$z_svl<- with(newt1_rich_meta,as.numeric(scale(svl))) # mean centered svl (snout-ventral length)
+  newt1_rich_meta$watertemp<-factor(newt1_rich_meta$watertemp)
+  newt1_rich_meta$infection<-factor(newt1_rich_meta$infection)
+  #newt1_rich_meta$ph<-factor(newt1_rich_meta$ph)
+  newt1_rich_meta$site<-factor(newt1_rich_meta$site)
+
+```
+
+## Alpha Models
+
+### Site, Sex, SVL
+```{r}
+
+#Maximal Model 
+  rich_mod1<-brm(Observed ~  site + sex + z_svl, data = newt1_rich_meta, family = negbinomial())
+  summary(rich_mod1)
+
+#Diagnostics
+  pp_check(rich_mod1)
+  bayes_R2(rich_mod1)
+  
+#Plot
+  conditional_effects(rich_mod1)
+  
+#Null Model 
+    rich_mod_null<-brm(Observed ~  1, data = newt1_rich_meta, family = negbinomial())
+    
+#Add ICs
+    rich_mod1<-add_criterion(rich_mod1,"loo")
+    rich_mod_null<-add_criterion(rich_mod_null,"loo")
+#Compare    
+    loo_compare(rich_mod1,rich_mod_null)
+    
+#Extract Estimates
+    rich_predict<-  conditional_effects(rich_mod1)[[1]]
+
+
+```
+
+### pH 
+```{r}
+  
+  #Numeric
+    #newt1_rich_meta$ph<-as.numeric(as.character(newt1_rich_meta$ph))
+
+  #Model 
+    ph_model1<-brm(Observed ~ ph + I(ph^2) + infection,data=newt1_rich_meta,family=negbinomial())
+    summary(ph_model1)
+    
+    #Diagnostics
+      pp_check(ph_model1)
+      bayes_R2(ph_model1)
+      
+    #Plots
+      conditional_effects(ph_model1)
+      
+    #Model Selection 
+      ph_model_null<-brm(Observed ~ 1,data=newt1_rich_meta,family=negbinomial())
+      ph_model1<-add_criterion(ph_model1,"loo")
+      ph_model_null<-add_criterion(ph_model_null,"loo")
+      loo_compare(ph_model_null,ph_model1)
+      
+    #Extract   
+      ph_predict<-conditional_effects(ph_model1)[[1]]
+```
+
+### Infection Class
+
+```{r}
+
+#Subset Data
+  newt1_rich_infection<- newt1_rich_meta %>% mutate(infection=factor(infection)) %>% filter(site %in% c("R4","Rnew"))
+
+#Model 
+  infect_mod1<-brm(Observed ~ infection*site,family=negbinomial(), data=newt1_rich_infection)
+    summary(infect_mod1)
+    
+    pp_check(infect_mod1)
+    bayes_R2(infect_mod1)
+    
+    conditional_effects(infect_mod1)
+
+  ## Null Model 
+          infect_mod_null<-brm(Observed ~ 1,family=negbinomial(), data=newt1_rich_infection)
+
+  #Add ICs
+      infect_mod1<-add_criterion(infect_mod1,"loo")  
+        infect_mod_null<-add_criterion(infect_mod_null,"loo")   
+#Select
+        print(loo_compare(infect_mod1,infect_mod_null),simplify=F)
+        
+#Model Predictions 
+    infect_pred_data<-data.frame(site=rep(c("R4","Rnew"),2),infection=rep(c(0,1),each=2))
+    infect_predict<-conditional_effects(infect_mod1,"site:infection")[[1]]
+```
+
+### Infection Severity
+
+```{r}
+
+#combine infection categories c/d
+  newt1_rich_meta$infection_collapse<-as.factor(newt1_rich_meta$infectioncode)
+  table(newt1_rich_meta$infection_collapse)
+  levels(newt1_rich_meta$infection_collapse)<-c("A","B","C","C")
+
+#Filter
+  newt1_rich_meta_filter<- filter(newt1_rich_meta,!is.na(infection_collapse))
+  nrow(newt1_rich_meta_filter) #47
+  
+#Infection Model 
+  severity_model1<-brm(Observed ~ infection_collapse,data= newt1_rich_meta_filter,family=negbinomial())
+  summary(severity_model1)
+  
+    #Diagnostics
+    pp_check(severity_model1)
+    bayes_R2(severity_model1)
+    
+  #Plot
+    conditional_effects(severity_model1)
+```
+
+## Alpha Plots
+
+### Richness by Site
+```{r} 
+##Richness By Site 
+rich_site1 <- ggplot()  + geom_jitter(data=newt1_rich_meta,aes(x=site,y=Observed, fill = site),color="white",shape=21,size=5,width=0.2) + scale_fill_brewer(palette = "Paired") + theme_bw(base_size=15) + theme(text = element_text(size = 18)) #+ guides(fill="none") 
+rich_site2<-rich_site1 + geom_errorbar(data=rich_predict,aes(x=site,ymin=lower__,ymax=upper__),width=0.1,lwd=1.2) + geom_point(data=rich_predict,aes(x=site,y=estimate__),shape=23,size=5,fill="white") + labs(x="Site",y="Alpha Diversity \n (Richness)")  + scale_fill_manual(values=sitecols)
+rich_site3<- rich_site2 +
+  theme(legend.key = element_rect(fill = "white"), legend.text = element_text(color = "white"), legend.title = element_text(color = "white")) + guides(fill = guide_legend(override.aes = list(fill = NA)))
+rich_site3
+ggsave2('Richness by Site Dec23.pdf',rich_site3,height=15,width=16,units="cm")
+
+```
+
+
+### Shannon Split by Infection Status   
+
+```{r}
+rich_infection<- ggplot() + geom_point(data=newt1_rich_infection,aes(x=site,y=Observed,fill=site,shape=infection),position = position_jitterdodge(),size=5,color="white")  + theme_bw(base_size=15) + theme(legend.position = "right") + scale_shape_manual(name="Amphibiothecum \n Infection",values=c(21,24),labels=c("No Visible \n Infection","Infected"))  
+
+rich_infection2<- rich_infection  + labs(y="Alpha Diversity \n (Richness)",x="Site") #+ theme(legend.text = element_text(size=12),legend.title = element_text(size=12))
+rich_infection3<- rich_infection2 + geom_errorbar(data=infect_predict,aes(x=site,ymin=lower__,ymax=upper__,group=infection),position = position_dodge(width=0.7),width=0.1,lwd=1.2) + geom_point(data=infect_predict,aes(x=site,y=estimate__,group=infection),position = position_dodge(width=0.7),shape=23,size=5,fill="white") + scale_fill_manual(values=sitecols[c(3,4)]) + guides(fill="none") + guides(shape = guide_legend(override.aes = list(color = "black") ) )+ theme(legend.position = "right")
+rich_infection3 
+ggsave2('Richness by Infection Dec23.pdf',rich_infection3,height=15,width=18,units="cm")
+```
+
+### pH scatterplot
+```{r}
+newt1_rich_meta<-mutate(newt1_rich_meta,infection=factor(infection))
+
+richness_ph_scatter<-ggplot(data=newt1_rich_meta, aes(x=as.numeric(as.character(ph)), y=Observed)) +
+  geom_jitter(aes(fill=site,shape=infection),color="white", size=5.5, width = 0.05) +
+  theme(text = element_text(size = 40)) +
+  theme_bw(base_size=15) +
+  xlab("pH") + 
+  ylab("Alpha Diversity \n (Richness)") + scale_shape_manual(name="Amphibiothecum \n Infection",values=c(21,24),labels=c("No Visible \n Infection","Infected")) + scale_fill_manual(values=sitecols) + labs(fill="Site")
+
+richness_ph_scatter2<- richness_ph_scatter + theme(legend.position = "right")  + scale_x_continuous(n.breaks=8)
+richness_ph_scatter3<- richness_ph_scatter2 + geom_ribbon(data=ph_predict,aes(x=ph,ymin=lower__,ymax=upper__),alpha=0.3) + geom_line(data=ph_predict,aes(x=ph,y=estimate__),col="blue") + guides(shape = guide_legend(override.aes = list(color = "black"))) + guides(fill = guide_legend(override.aes = list(shape=21))) + theme(axis.text.x = element_text(angle=45,hjust=1,vjust=1))
+richness_ph_scatter3
+
+ggsave2('Richness ph Dec23.pdf',richness_ph_scatter3,height=12,width=20,units="cm")
+```
+
+## Combined Alpha Diversity Plot
+
+```{r}
+
+#Column Format
+  alpha_column1<-plot_grid(richness_ph_scatter3,rich_infection3,ncol=1,labels="AUTO",label_size = 30)
+
+ggsave2('Fig_3_Newt Richness Combined Plot.pdf',alpha_column1,width=22,height=40,units="cm")
+ggsave2('Fig_3_Newt Richness Combined Plot.tiff',alpha_column1,width=22,height=30,units="cm")
+
+```
+
+
+# BETA DIVERSITY
+
+```{r}
+##Vegan function to convert phyloseq obj. into something Vegan can call directly
+    vegan_otu <- function(physeq) {
+      OTU <- otu_table(physeq)
+      if (taxa_are_rows(OTU)) {
+        OTU <- t(OTU)
+      }
+      return(as(OTU, "matrix"))
+    }
+
+####TIME POINT 1 PCA####
+
+##CLR Transform - Round 1 sampling only
+  newt1_clr <- microbiome::transform(newt1, "clr") 
+  #head(otu_table(newt1_clr))
+
+##Extract Matrix and Sample Data
+  newt1_clr_v<-vegan_otu(newt1_clr) #???
+  newt1_clr_s<-as(sample_data(newt1_clr),"data.frame")
+
+##Merge C/D infection codes
+    newt1_clr_s$infectioncode[is.na(newt1_clr_s$infectioncode)] <- "0"
+    newt1_clr_s$infectioncode<-as.factor(newt1_clr_s$infectioncode)
+    levels(newt1_clr_s$infectioncode)<-c("0","A","B","C/D","C/D")
+    levels(newt1_clr_s$infectioncode)
+
+###Principal Components Analysis 
+  newt1_pc<-prcomp(newt1_clr_v)
+  #biplot(newt1_pc)
+  #plot(newt1r_pc)
+  summary(newt1_pc)$importance[,1:2]
+  newt1_pc_scores<-scores(newt1_pc)
+  newt1_pc_scores_sub<-newt1_pc_scores[,1:2]
+  newt1_pc_scores_sub<-cbind(newt1_pc_scores_sub,newt1_clr_s)
+
+##Housekeeping + Label Setup    
+  newt1_pc_scores_sub$site<-as.factor(newt1_pc_scores_sub$site)
+  newt1_pc_scores_sub$infectioncode<-as.factor(newt1_pc_scores_sub$infectioncode)
+
+### Plot  
+  newt1plotdata<-gg_ordiplot(newt1_pc,groups=newt1_clr_s$site,spider=T,plot=T)
+  newt1plotdata2<-newt1plotdata$df_ord
+  newt1plotdata3<-cbind(newt1plotdata2,newt1_clr_s)
+  newt1plotdata3$infection<-factor(newt1plotdata3$infection)
+  
+  gg1<-ggplot(newt1plotdata3,aes(x=x,y=y)) + geom_segment(data = newt1plotdata$df_spiders, aes(x = cntr.x, xend = x, y = cntr.y, yend = y, color = Group), 
+    show.legend = FALSE) + geom_point(aes(shape=infection,fill=site),size=7,color="white") + scale_shape_manual(values=c(21,24),name="Amphibiothecum Infection",labels=c("No Visible Infection","Infected"))
+  gg2<- gg1 + geom_path(data = newt1plotdata$df_ellipse, aes(x = x, y = y, color = Group), show.legend = FALSE)
+  gg3<- gg2 + theme_bw(base_size=15) + theme(legend.position = "right")
+  gg4<- gg3 + guides(fill=guide_legend(nrow=3,byrow=TRUE),shape = guide_legend(override.aes = list(color = "black") ),fill= guide_legend(override.aes = list(color = "black",shape=21))) + labs(x="PC1 (18.6%)",y="PC2 (15.8%)",fill="Site") + guides(fill = guide_legend(override.aes = list(shape=21))) 
+  gg5 <- gg4 + scale_fill_manual(values=sitecols) + scale_color_manual(values=sitecols) 
+  gg5
+  
+  ggsave2('Newt Visit1 CLR PCA.pdf',gg5,width=20,height=15,units="cm")
+  
+```
+
+## PERMANOVA
+
+```{r}
+
+##Run PERMANOVA on CLR transformed data
+raw_permanova<- adonis2(newt1_clr_v ~ site + infection,data=newt1_clr_s,nperm=999,method="euclidean",by="mar")
+raw_permanova #site: r2=26.6% , infection: r2=2.8%  
+
+
+```
+
+## Stacked Barplots
+
+```{r}
+##Filter Samples With No Data using phyloseq object containing clean dataset, which has been filtered from negative/positive control + contaminants, but not filtered for low freq reads.
+  # ps_clean_filter_filter<-prune_samples(sample_sums(ps_clean_filter)>0,ps_clean_filter)
+  # newt_phylum <- ps_clean_filter_filter %>% aggregate_taxa(level = "Phylum") %>% microbiome::transform(transform = "compositional")
+  
+#Aggregate To Order Level and Transform to Relative Abundance (fraction of reads, rather than count of reads)
+  #newt_order <- newt.clean.bacteria.sub %>% aggregate_taxa(level = "Order") %>% microbiome::transform(transform = "compositional")
+
+#Phylum Colours
+  
+##Plot Again But With Top 'N' taxa
+  newt_phylumcollapse<- newt1 %>% aggregate_taxa(level="Phylum") 
+  newt_top5phyla = names(sort(taxa_sums(newt_phylumcollapse), TRUE)[1:5]) #What Are the Names of the most abundant phyla?  
+  newt_top5phylum_filter<-subset_taxa(newt1,Phylum %in% newt_top5phyla) #Subset the phyloseq object to those phyla
+  infectionlong<-ifelse(sample_data(newt_top5phylum_filter)$infection==0,"Uninfected","Infected") #Site and Infection status- Phylum
+  sample_data(newt_top5phylum_filter)$site_infection<-with(sample_data(newt_top5phylum_filter),paste(site,infectionlong,sep=" "))
+
+##Remake our graph but with grouping by site
+newt_top5phylum_plot <- newt_top5phylum_filter %>%                   
+  aggregate_taxa(level = "Phylum") %>%  
+  microbiome::transform(transform = "compositional") %>%
+  plot_composition(sample.sort = "Firmicutes", average_by = "site_infection",group_by = "site")
+newt_top5phylum_plot <- newt_top5phylum_plot + theme_bw() + 
+  scale_fill_manual("Phylum", values=moma.colors("Liu",5)) + 
+  theme(legend.position = "bottom") + 
+  theme(text = element_text(size = 22)) + labs(x="Site & Infection Status") +
+  theme(axis.text.x = element_text(angle=45, vjust=1, hjust=1)) + guides(fill=guide_legend(nrow=3,byrow=TRUE))
+newt_top5phylum_plot 
+
+ggsave2('Time 1 Phylum Barplot.pdf',newt_top5phylum_plot,height=20,width=20,units="cm")
+  
+```
+
+## CCA Model 
+
+###  Model 
+
+```{r}
+      
+    ######
+        #Extract Matrix and Sample Data  
+          newt1_rare_v<-vegan_otu(newt1)
+          newt1_rare_s<-as(sample_data(newt1),"data.frame")
+
+     ##### INDIVIDUAL PREDICTORS
+          newt_cca<-cca(newt1_rare_v ~ infection + ph + svl,data=newt1_rare_s,strata=frog_rare_s$frog_id)
+            car::Anova(newt_cca)
+
+```
+
+### CCA PLot
+
+```{r}
+#Extract Biplot Dat aand Filter Out the Social Group
+  bip <- data.frame(scores(newt_cca, choices = 1:2, display = "bp")) 
+  bip_filter<- bip  #(bip[-grep("site",rownames(bip)),])
+
+#Scaling Factor
+(mul <- ordiArrowMul(bip,display="sites", fill = 0.8))
+    bip.scl <- bip_filter * 2    
+    labs<-c("Infection","pH","SVL")
+    
+#Extract Plotting Data
+  newt_cca_plotdata<- ggvegan::fortify(newt_cca) %>% filter(score=="sites")
+  
+#Copy Across Metadata
+  newt_cca_plotdata$site_id<-newt1_rare_s$site
+  newt_cca_plotdata$infection<-ifelse(newt1_rare_s$infection==0,"No Visible Infection","Infected")
+
+#Plot    
+  newt_cca_plot1<- ggplot(newt_cca_plotdata,aes(x=CCA1,y=CCA2)) + geom_point(color="white",aes(shape=infection,fill=site_id),size=7) + theme_bw(base_size=15) + scale_shape_manual(values=c(24,21)) + guides(fill = guide_legend(override.aes = list(shape = 21)))   + scale_fill_manual(values=sitecols) + scale_color_manual(values=sitecols) 
+#Add Biplot Arrows
+  newt_cca_plot2<- newt_cca_plot1 + geom_segment(data=bip.scl,aes(x=0,y=0,xend=CCA1,yend=CCA2),arrow=arrow(length=unit(0.2,"cm")),color="grey") #+ lims(x=c(-6,5))
+  newt_cca_plot3 <- newt_cca_plot2 + geom_text_repel(data=bip.scl,aes(x=CCA1,y=CCA2,label=labs),color="grey40",size=5) + labs(fill="Site",shape="Amphibiothecum Infection")  + guides(shape = guide_legend(override.aes = list(color = "black") ))
+  newt_cca_plot3
+  
+  ggsave2('Newt Visit1 CCA.pdf',newt_cca_plot3,width=22,height=15,units="cm")
+
+```
+
+
+### Combined Plot
+```{r}
+betaplot1<-plot_grid(gg5,newt_cca_plot3,nrow=2,labels="AUTO",rel_widths=c(1,1),label_size = 30)
+betaplot1
+
+ggsave2('Newt Visit1 CLR CCA Combined.pdf',betaplot1,width=25,height=25,units="cm")
+```
+
+## Core Microbiome Visit 1
+
+### Newt Site Specific Core
+
+```{r}
+
+#Unique Sites
+  newtsites <- unique(as.character(meta(newt1)$site))
+#Taxonomy Dataframe
+  newt1_taxdata<-as.data.frame(tax_table(newt1))
+
+#Write a for loop to go through each of the disease_states one by one and combine identified core taxa into a list.
+
+      sites_core <- c() # an empty object to store information
+      sites_core_taxonomy<-c()
+      
+      for (n in newtsites){ # for each variable n in DiseaseState
+          #print(paste0("Identifying Core Taxa for ", n))
+          
+          ps.sub <- subset_samples(newt1, site == n) # Choose sample from n
+          
+          core_m <- core_members(ps.sub, # ps.sub is phyloseq selected with only samples from g 
+                                 prevalence = 0.9)
+          print(paste0("No. of core taxa in ", n, " : ", length(core_m))) # print core taxa identified in each DiseaseState.
+          sites_core[[n]] <- core_m # add to a list core taxa for each group.
+          sites_core_taxonomy[[n]]<-subset(newt1_taxdata,rownames(newt1_taxdata) %in% core_m)
+          #print(list_core)
+      }
+
+
+#Check Core Taxa Not a FUnction of Sample size
+      site_ncore_taxa<-data.frame(ntaxa=sapply(sites_core,length))
+      site_nsamples<-data.frame(nsample=table(meta(newt1)$site))
+      site_nsamples$ncore<-site_ncore_taxa[,1][match(site_nsamples[,1],rownames(site_ncore_taxa))]
+      ggplot(site_nsamples,aes(x=nsample.Freq,y=ncore)) + geom_smooth(method = "lm") + geom_point(shape=21,size=5,fill="white") + theme_bw()
+      site_ncore_taxa$site<-rownames(site_ncore_taxa)
+      
+### Strip Out Taxonomy 
+      site_core_family_prop<-lapply(lapply(sites_core_taxonomy,function(x) table(x$Family)),function(x) x/sum(x))
+      site_core_family_prop2<-lapply(site_core_family_prop,function(x) data.frame(family=names(x),prop=x))
+      for(i in 1:length(site_core_family_prop2)){site_core_family_prop2[[i]]$site<-names(site_core_family_prop2)[i]}
+      site_core_df<-do.call(rbind.data.frame, site_core_family_prop2)
+      colnames(site_core_df)<-c("Family","Prop","Proportion","Site")
+      corefamtab<-(table(site_core_df$Family)); corefams<-names(corefamtab)[corefamtab>1]
+      site_core_df$Family_collapse<-ifelse(site_core_df$Family %in% corefams,site_core_df$Family,"Other")
+      site_core_df$Family_collapse<-factor(site_core_df$Family_collapse,levels=c("Burkholderiaceae","Comamonadaceae","Oxalobacteraceae","Pseudoalteromonadaceae","Other"))
+
+### Plot
+      site_core_cols<-c(brewer.pal(5,"Paired"))
+      site_core_plot1<-ggplot(site_core_df) + geom_bar(aes(x=Site,y=Proportion,fill=Family_collapse),stat="identity",color="grey40") + scale_fill_manual(values=site_core_cols) + theme_bw(base_size=15) + labs(fill="Family") + theme(legend.position = "top") #+ guides(fill=guide_legend(nrow=2))
+      site_core_plot2<-site_core_plot1 + geom_text(data=site_ncore_taxa,aes(x=site,y=1,label=ntaxa),vjust=-0.2,cex=8) + guides(fill=guide_legend(nrow=3))
+      site_core_plot2
+      ggsave2('Core Visit 1 by Site.pdf',site_core_plot2,width=30,height=18,units="cm")
+      
+      
+```
+
+### Disease Venn
+```{r}
+### Plot Venn
+  core_venn_cols<-brewer.pal(5,"Set2")[c(1:4)]
+  core_vennplot1<-ggvenn(sites_core,fill_color = core_venn_cols,text_size = 8,set_name_size = 10)
+  core_vennplot1
+  
+```
+
+### Combined Core Plot
+
+```{r}
+core_grid<-plot_grid(site_core_plot2,core_vennplot1,labels="AUTO",ncol=2,label_size = 30)
+ggsave2('Fig_6_Newt Core Microbiomes.pdf',core_grid,width=45,height=25,units="cm")
+```
+
+### Genus Level Core Taxonomy
+
+```{r}
+### Strip Out Taxonomy 
+      site_core_genus<-lapply(lapply(sites_core_taxonomy,function(x) table(x$Genus)),function(x) x/sum(x))
+      site_core_genus2<-lapply(site_core_genus,function(x) data.frame(genus=names(x),prop=x))
+      for(i in 1:length(site_core_genus2)){site_core_genus2[[i]]$site<-names(site_core_genus2)[i]}
+      site_core_genus_df<-do.call(rbind.data.frame, site_core_genus2)
+      colnames(site_core_genus_df)<-c("Genus","Genus","Proportion","Site")
+      write.csv(site_core_genus_df,'Site Core ASVs Genus.csv')
+  
+```
+
+# GENERAL LINEAR LATENT VARIABLE MODELS
+
+## Models 
+```{r}
+
+#Infected Sites
+newt_infected<-prune_samples(sample_data(newt1)$site %in% c("R4","Rnew"),newt1)
+
+## OTUs Top 50
+  newt_infected_genus<-aggregate_top_taxa2(newt_infected, "Genus", top = 50)
+  clr_scaled <-microbiome::transform(newt_infected_genus, transform = "clr")
+
+#Extract
+  ys <- data.frame(t(otu_table(clr_scaled)))
+  names(ys) <-taxa_names(clr_scaled)
+  
+#Predictors
+  Xs<-data.frame(sample_data(clr_scaled)) %>% dplyr::select(site,infection,svl)
+ 
+## Model 
+  fit_reduced_scaled <- gllvm(ys, Xs, 
+                              num.lv = 2,
+                              formula = ~ site * infection,
+                              family = "gaussian",starting.val='zero')
+  
+    coefplot(fit_reduced_scaled)
+    #plot(fit_reduced_scaled)
+```
+
+## Plots of Effects
+```{r}
+#Estimates 
+  df<-coef(fit_reduced_scaled)
+  est_df<-data.frame(df$Intercept)
+  est_df2<-data.frame(df$Xcoef) 
+  est_df3<-merge(est_df, est_df2, by = 0)
+  
+#Order genera
+  row.names(est_df3)<-est_df3$Row.names
+  est_df3<-est_df3[colnames(ys),]
+  names(est_df3)[1]<- "Genus"
+  names(est_df3)[2]<- "Intercept"
+  
+
+### COnfidence Intervals
+  confint_df<-data.frame(confint(fit_reduced_scaled))
+  
+#Identify Rows with Main Effects
+   one_comma<-sapply(rownames(confint_df),function(x) length(gregexpr(":", x, fixed = TRUE)[[1]]))==1
+   
+###Strip Out Individual Datasets
+  ##R4
+    r4_main<-grepl("^Intercept",rownames(confint_df))
+    int_data_r4<-cbind(est_df3[,c("Genus","Intercept")],confint_df[r4_main,])
+  ##Rnew
+    rnew_main<-grepl("^Xcoef.siteRnew",rownames(confint_df)) & one_comma==TRUE
+    int_data_rnew<-cbind(est_df3[,c("Genus","siteRnew")],confint_df[rnew_main,])
+  ##Infection
+    infection_main<-grepl("Xcoef.infection",rownames(confint_df))
+    int_data_infection<-cbind(est_df3[,c("Genus","infection")],confint_df[infection_main,])
+  #Rnew:Infection
+     rnew_infect_main<-grepl("^Xcoef.siteRnew:infection",rownames(confint_df))
+    int_data_rnew_infect<-cbind(est_df3[,c("Genus","siteRnew.infection")],confint_df[rnew_infect_main,])
+
+  
+#Extra Variables and Rename Columns 
+  colnames(int_data_rnew)<-c("Genus","Estimate","l95","u95")
+  colnames(int_data_infection)<-c("Genus","Estimate","l95","u95")
+  colnames(int_data_rnew_infect)<-c("Genus","Estimate","l95","u95")
+ 
+  int_data_rnew$trait<-"Site Rnew"
+  int_data_infection$trait<-"Infection"
+  int_data_rnew_infect$trait<-"Rnew:Infection"
+    
+  newt_mod_plotdata<-rbind(int_data_infection,int_data_rnew_infect)
+
+#Order   
+  newt_mod_plotdata$trait<-factor(newt_mod_plotdata$trait,levels=c("Infection","Rnew:Infection"))
+  
+  newt_mod_plotdata2<- newt_mod_plotdata %>% group_by(trait)  %>% arrange(Estimate,.by_group=T)
+  newt_mod_plotdata2$Genus<-factor(newt_mod_plotdata2$Genus,levels=unique(newt_mod_plotdata2$Genus))
+#Significance  
+  newt_mod_plotdata2$Sig<- !data.table::between(0, newt_mod_plotdata2$l95, newt_mod_plotdata2$u95)
+   
+  sig_col<-brewer.pal(5,"Set1")[2]
+
+### plot  
+  newt_plot1<-ggplot(newt_mod_plotdata2,aes(x=Estimate,y=Genus)) + geom_errorbar(aes(y=Genus,xmin=l95,xmax=u95,color=Sig),alpha=0.6) + geom_point(size=5,shape=21,color="gray40",aes(fill=Sig),alpha=0.9)
+  
+  newt_plot2<- newt_plot1 + theme_bw(base_size = 15) + geom_vline(xintercept=0,linetype="dashed") + scale_color_manual(values=c("gray40",sig_col)) + scale_fill_manual(values=c("white",sig_col)) + guides(fill="none",color="none") + facet_wrap(.~trait,scales = "free_x")
+  newt_plot2
+```
+
+## Significant Bacterial Trends 
+```{r}
+
+
+##Pseudomonas 
+  pseudo_df<-data.frame(count=as.numeric(otu_table(clr_scaled)[which(rownames(otu_table(clr_scaled))=="Pseudomonas"),]),site=sample_data(newt_infected_genus)$site,infection=sample_data(newt_infected_genus)$infection)
+  pseudo_df$infection2<-ifelse(pseudo_df$infection==1,"Infected","No Visible Infection")
+  pseudo_plot1<-ggplot(pseudo_df,aes(x=site,y=count,group=infection2)) + geom_point(aes(fill=site,shape=infection2),size=5,color="gray77",position = position_jitterdodge(dodge.width = 0.75)) + theme_bw(base_size = 18) + scale_fill_manual(values = sitecols[3:4]) + scale_shape_manual(values=c(24,21)) + guides(fill="none") + labs(x="Site",y="Count (CLR)",shape="Amphibiothecum \nInfection") + theme(legend.position = "top") + stat_summary(fun = "mean",geom = "point",
+    col = "white",size = 5,shape = 23,fill = "lightblue",position = position_dodge(width = 0.75)) + geom_text(x=1.5,y=5,label="Pseudomonas",cex=8) + guides(shape=guide_legend(nrow=2,byrow=TRUE)) 
+  pseudo_plot1  
+  
+ ##Bacteroides 
+  bacteroides_df<-data.frame(count=as.numeric(otu_table(clr_scaled)[which(rownames(otu_table(clr_scaled))=="Bacteroides"),]),site=sample_data(newt_infected_genus)$site,infection=sample_data(newt_infected_genus)$infection)
+  bacteroides_df$infection2<-ifelse(bacteroides_df$infection==1,"Infected","No Visible Infection")
+  bacteroides_plot1<-ggplot(bacteroides_df,aes(x=site,y=count,group=infection2)) + geom_point(aes(fill=site,shape=infection2),size=5,color="gray77",position = position_jitterdodge(dodge.width = 0.75)) + theme_bw(base_size = 18) + scale_fill_manual(values = sitecols[3:4]) + scale_shape_manual(values=c(24,21)) + guides(fill="none") + labs(x="Site",y="Count (CLR)",shape="Amphibiothecum \nInfection") + theme(legend.position = "top") + stat_summary(fun = "mean",geom = "point",
+    col = "white",size = 5,shape = 23,fill = "lightblue",position = position_dodge(width = 0.75)) + guides(shape=guide_legend(nrow=2,byrow=TRUE)) + geom_text(x=1.5,y=4,label="Bacteroides",cex=8)
+  bacteroides_plot1   
+  
+
+  
+##Janinthobacterium 
+  janinthobacterium_df<-data.frame(count=as.numeric(otu_table(clr_scaled)[which(rownames(otu_table(clr_scaled))=="Janthinobacterium"),]),site=sample_data(newt_infected_genus)$site,infection=sample_data(newt_infected_genus)$infection)
+  janinthobacterium_df$infection2<-ifelse(janinthobacterium_df$infection==1,"Infected","No Visible Infection")
+  janinthobacterium_plot1<-ggplot(janinthobacterium_df,aes(x=site,y=count,group=infection2)) + geom_point(aes(fill=site,shape=infection2),size=5,color="gray77",position = position_jitterdodge(dodge.width = 0.75)) + theme_bw(base_size = 18) + scale_fill_manual(values = sitecols[3:4]) + scale_shape_manual(values=c(24,21)) + guides(fill="none") + labs(x="Site",y="Count (CLR)",shape="Amphibiothecum \nInfection") + theme(legend.position = "top") + stat_summary(fun = "mean",geom = "point",
+    col = "white",size = 5,shape = 23,fill = "lightblue",position = position_dodge(width = 0.75)) + guides(shape=guide_legend(nrow=2,byrow=TRUE)) + geom_text(x=1.5,y=3,label="Janthinobacterium",cex=8)
+  janinthobacterium_plot1  
+  
+  ##Chryseobacterium 
+  chryseobacterium_df<-data.frame(count=as.numeric(otu_table(clr_scaled)[which(rownames(otu_table(clr_scaled))=="Chryseobacterium"),]),site=sample_data(newt_infected_genus)$site,infection=sample_data(newt_infected_genus)$infection)
+  chryseobacterium_df$infection2<-ifelse(chryseobacterium_df$infection==1,"Infected","No Visible Infection")
+  chryseobacterium_plot1<-ggplot(chryseobacterium_df,aes(x=site,y=count,group=infection2)) + geom_point(aes(fill=site,shape=infection2),size=5,color="gray77",position = position_jitterdodge(dodge.width = 0.75)) + theme_bw(base_size = 18) + scale_fill_manual(values = sitecols[3:4]) + scale_shape_manual(values=c(24,21)) + guides(fill="none") + labs(x="Site",y="Count (CLR)",shape="Amphibiothecum \nInfection") + theme(legend.position = "top") + stat_summary(fun = "mean",geom = "point",
+    col = "white",size = 5,shape = 23,fill = "lightblue",position = position_dodge(width = 0.75)) + guides(shape=guide_legend(nrow=2,byrow=TRUE)) + geom_text(x=1.5,y=0,label="Chryseobacterium",cex=8)
+  chryseobacterium_plot1  
+
+```
+
+### Combined Model and Output Plot
+```{r}
+
+#Abundance Grid 
+  gllvm_abund_grid<-plot_grid(chryseobacterium_plot1,janinthobacterium_plot1,bacteroides_plot1,pseudo_plot1,nrow=2,
+            label_size = 20)
+#Stitch onto Model 
+  gllvm_combined<-plot_grid(newt_plot2,gllvm_abund_grid,nrow=2,labels="AUTO",label_size=30)
+  ggsave2('Newt GLLVM Combined Output.png',gllvm_combined,width=30,height=50,units="cm")
+
+```
+
+## Correlation Plots
+```{r}
+#### Correlations
+  cr1<-data.frame(getResidualCor(fit_reduced_scaled))#
+  
+  names(cr1)<-names(ys)
+  names(cr1)<-abbreviate(names(cr1), minlength = 15)
+  rownames(cr1)<-abbreviate(rownames(cr1), minlength = 15 )
+  
+  library(rstatix)
+  #devtools::install_github("kassambara/ggcorrplot")
+  library(ggcorrplot)
+  #install.packages("ggpubr")
+  library(ggpubr)
+  
+  cr2<-cor_pmat(cr1)
+  
+  corplot<-ggcorrplot(cr1, 
+                      hc.order = TRUE,
+                      outline.col = "white",
+                      type = "full",
+                      ggtheme = ggplot2::theme_minimal(base_size = 10),
+                      tl.cex = 12,
+                      p.mat = cr2,
+                      sig.level = 0.05,
+                      lab_size = 15,
+                      #show.diag = F,
+                      insig = "blank",
+                      # colors = c("#6D9EC1", "white", "#E46726"))
+                      colors = c("blue", "white", "red"))+
+    theme(axis.text.x = element_text(angle = 90, vjust=0.5))+
+    theme(plot.margin=unit(c(0.2,0.2,0.2,2),"cm"))
+  corplot
+  
+## Save Grid
+  #newt_mod_combined1<-ggarrange(newt_plot2,corplot,nrow=2,widths=c(1,0.8),align="h",labels="AUTO",font.label=list(size=30))
+  #newt_mod_combined1
+  cowplot::ggsave2('Newt GLLVM Residual Correlations.pdf',corplot,width=25,height=25,units = "cm")
+  
+
+```
+
+
+# PREDICTED FUNCTIONAL ANALYSIS
+
+## Prepare for MicFunPred
+Adapted from https://forum.qiime2.org/t/importing-dada2-and-phyloseq-objects-to-qiime-2/4683
+```{r}
+
+# ## Trim Newt1
+# newt1_filter<-prune_taxa(taxa_sums(newt1)>200,newt1)
+# 
+# #Make Fasta File From Sequences
+# #remotes::install_github("alexpiper/seqateurs")
+# library(seqateurs)
+# ps_to_fasta(newt1_filter)
+# 
+# #Export Feature Table 
+#   #library(biomformat);packageVersion("biomformat")
+#    otu<-t(as(otu_table(newt1_filter),"matrix")) # 't' to transform if taxa_are_rows=FALSE
+#   #Rename ASVs to Match FASTA above
+#    rownames(otu)<-paste0("ASV_",seq(nrow(otu)))
+#   #Fix Sample Names
+#    true_samples_newt1filter<-colnames(otu)
+#    colnames(otu)<-paste0("sample",seq(ncol(otu)))
+#   #Write File 
+#     # otu_biom<-make_biom(data=otu)
+#     # write_biom(otu_biom,"Newt1_filter.biom")
+#    write.table(otu,'newt1_filter.tsv',sep="\t",row.names=TRUE, col.names=TRUE, quote=FALSE)
+# 
+# ## Sample Data
+# newt1_samplemeta<-as(sample_data(newt1_filter),"data.frame")
+# write.csv(newt1_samplemeta,"Newt1_Filter_sample-metadata.csv")
+
+```
+
+
+
+# BETA DIVERSITY OVER TIME
+
+```{r}
+
+# Visit 1 and 2
+  newt2<-prune_samples(sample_data(ps_clean_filter)$visit %in% seq(2) & !sample_data(ps_clean_filter)$site %in% c("R44","Rnew"),ps_clean_filter)
+
+##CLR Transform - Round 1 & 2 sampling only
+  newt2_clr <- microbiome::transform(newt2, "clr") 
+
+##Extract Matrix and Sample Data
+  newt2_clr_v<-vegan_otu(newt2_clr) #???
+  newt2_clr_s<-as(sample_data(newt2_clr),"data.frame")
+
+###Principal Components Analysis 
+  newt2_pc<-prcomp(newt2_clr_v)
+  summary(newt2_pc)$importance[,1:2]
+## Metadata  
+  newt2_pc_scores<-scores(newt2_pc)
+  newt2_pc_scores_sub<-newt2_pc_scores[,1:2]
+  newt2_pc_scores_sub<-cbind(newt2_pc_scores_sub,newt2_clr_s)
+
+##Housekeeping + Label Setup    
+  newt2_pc_scores_sub$site<-as.factor(newt2_pc_scores_sub$site)
+  newt2_pc_scores_sub$visit<-as.factor(newt2_pc_scores_sub$visit)
+  newt2_pc_scores_sub$site_visit<-with(newt2_pc_scores_sub,paste(site,visit))
+  
+### Plot  Data
+  newt2plotdata<-gg_ordiplot(newt2_pc,groups=newt2_pc_scores_sub$site_visit,spider=T,plot=T)
+  #newt2plotdata$plot + scale_color_brewer(palette = "Paired") + theme_bw() + geom_point(size=5)
+  
+  newt2plotdata2<-newt2plotdata$df_ord
+  newt2plotdata3<-cbind(newt2plotdata2,newt2_clr_s)
+  newt2plotdata3$Group<-factor(newt2plotdata3$Group)
+  newt2plotdata3$infection_text<-ifelse(newt2plotdata3$infection==0,"No Visible Infection","Infected")
+  
+  gg_twovisits1<-ggplot() + geom_segment(data = newt2plotdata$df_spiders, aes(x = cntr.x, xend = x, y = cntr.y, yend = y, color = Group), 
+    show.legend = FALSE) + geom_point(data=newt2plotdata3,aes(x=x,y=y,fill=Group,shape=infection_text),color="white",size=5)
+  gg_twovisits2<- gg_twovisits1 + geom_path(data = newt2plotdata$df_ellipse, aes(x = x, y = y, color = Group), show.legend = FALSE)
+  gg_twovisits3<- gg_twovisits2 + theme_bw(base_size=15)  + theme(legend.position = "right") + scale_shape_manual(values=c(24,21))
+  gg_twovisits4<- gg_twovisits3 + guides(shape = guide_legend(override.aes = list(color = "black") ) ) + labs(x="PC1 (16.09%)",y="PC2 (15.3%)",fill="Site  & Visit",shape="Amphibiothecum \n Infection") + guides(fill = guide_legend(override.aes = list(shape=21))) 
+  gg_twovisits5<-gg_twovisits4 + scale_color_brewer(palette="Paired") + scale_fill_brewer(palette = "Paired")
+  gg_twovisits5
+  
+  ggsave2('Newt 2 Time Point PCa.pdf',gg_twovisits5,width=24,height=15,units="cm")
+  
+```
+
+## PERMANOVA
+
+```{r}
+
+##Run PERMANOVA on CLR transformed data
+visit_permanova<- adonis2(newt2_clr_v ~ site*visit + infection,data=newt2_clr_s,nperm=999,method="euclidean")
+visit_permanova #
+
+
+
+```
+
+
+
